@@ -13,11 +13,13 @@ def to_rows(msgs):
         env = json.loads(m["Body"])
         seq = int(env["SequenceNumber"])      # monotonic per MessageGroupId
         body = json.loads(env["Message"])     # our CDC payload from publisher
+        commit_ts   = body.get("created_at") or None
+        lsn         = ""  # not used with outbox
         rows.append((
             body["customer_id"],
             seq,
-            body["lsn"],
-            body["commit_ts"],
+            lsn,
+            commit_ts,
             f"{body['schema']}.{body['table']}",
             body["kind"],
             json.dumps(body)
