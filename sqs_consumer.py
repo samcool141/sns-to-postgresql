@@ -1,52 +1,60 @@
-version: 0.2
+import os, json, time, boto3, psycopg2
+from psycopg2.extras import execute_values
 
-env:
-  variables:
-    AWS_REGION: "eu-north-1"
-    ECR_REPO: "sqs-consumer"
-    IMAGE_TAG: "latest"
-    # OPTIONAL ECS deploy vars:
-    # ECS_CLUSTER: "cdc-cluster"
-    # ECS_SERVICE: "sqs-consumer-svc"
-    # TD_FAMILY: "sqs-consumer"
+QURL   = os.getenv("SQS_URL")                 # https://sqs.eu-north-1.amazonaws.com/ACCT/customer-queue.fifo
+DB_DSN = os.getenv("DB_DSN")                  # secret-injected plain DSN
 
-phases:
-  pre_build:
-    commands:
-      - echo "==> Resolve account & ECR URI"
-      - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-      - ECR_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}
-      - echo "==> Ensure ECR repo exists"
-      - aws ecr describe-repositories --repository-names ${ECR_REPO} --region ${AWS_REGION} >/dev/null 2>&1 || aws ecr create-repository --repository-name ${ECR_REPO} --region ${AWS_REGION} >/dev/null
-      - echo "==> Login to ECR"
-      - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
-  build:
-    commands:
-      - echo "==> Build image"
-      - docker build -t ${ECR_REPO}:${IMAGE_TAG} .
-      - echo "==> Tag image"
-      - docker tag ${ECR_REPO}:${IMAGE_TAG} ${ECR_URI}:${IMAGE_TAG}
-      - echo "==> Push image"
-      - docker push ${ECR_URI}:${IMAGE_TAG}
-  post_build:
-    commands:
-      - echo "Build complete. Image: ${ECR_URI}:${IMAGE_TAG}"
-      # ===== OPTIONAL auto-deploy to ECS (uncomment to enable) =====
-      # - echo "==> Fetch current task definition"
-      # - aws ecs describe-task-definition --task-definition ${TD_FAMILY} --region ${AWS_REGION} --query 'taskDefinition' > td.json
-      # - echo "==> Create new task def JSON with updated image"
-      # - |
-      #   python - <<'PY'
-      #   import json, os
-      #   td=json.load(open('td.json'))
-      #   for k in ('taskDefinitionArn','revision','status','requiresAttributes','registeredBy','registeredAt','compatibilities'):
-      #       td.pop(k, None)
-      #   td['containerDefinitions'][0]['image'] = os.environ['ECR_URI']+':'+os.environ['IMAGE_TAG']
-      #   open('td-new.json','w').write(json.dumps(td))
-      #   PY
-      # - echo "==> Register new task definition"
-      # - NEW_TD_ARN=$(aws ecs register-task-definition --cli-input-json file://td-new.json --query 'taskDefinition.taskDefinitionArn' --output text --region ${AWS_REGION})
-      # - echo "==> Update ECS service"
-      # - aws ecs update-service --cluster ${ECS_CLUSTER} --service ${ECS_SERVICE} --task-definition ${NEW_TD_ARN} --region ${AWS_REGION}
-artifacts:
-  files: []
+sqs = boto3.client("sqs")
+
+def to_rows(msgs):
+    rows = []
+    for m in msgs:
+        # m["Body"] is SNS envelope JSON (because RawMessageDelivery = false)
+        env = json.loads(m["Body"])
+        seq = int(env["SequenceNumber"])      # monotonic per MessageGroupId
+        body = json.loads(env["Message"])     # our CDC payload from publisher
+        commit_ts   = body.get("created_at") or None
+        lsn         = ""  # not used with outbox
+        rows.append((
+            body["customer_id"],
+            seq,
+            lsn,
+            commit_ts,
+            f"{body['schema']}.{body['table']}",
+            body["kind"],
+            json.dumps(body)
+        ))
+    return rows
+
+def main():
+    conn = psycopg2.connect(DB_DSN)
+    conn.autocommit = False
+    try:
+        while True:
+            resp = sqs.receive_message(
+                QueueUrl=QURL,
+                MaxNumberOfMessages=10,
+                WaitTimeSeconds=20,       # long poll
+                VisibilityTimeout=60      # tune to your processing time
+            )
+            msgs = resp.get("Messages", [])
+            if not msgs:
+                continue
+
+            rows = to_rows(msgs)
+            with conn.cursor() as cur:
+                execute_values(cur, """
+                  INSERT INTO target.cdc_events
+                  (customer_id, sns_sequence, lsn, commit_ts, table_name, op, payload)
+                  VALUES %s
+                """, rows)
+            conn.commit()
+
+            # delete in batch
+            entries = [{"Id": m["MessageId"], "ReceiptHandle": m["ReceiptHandle"]} for m in msgs]
+            sqs.delete_message_batch(QueueUrl=QURL, Entries=entries)
+    finally:
+        conn.close()
+
+if __name__ == "__main__":
+    main()

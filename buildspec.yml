@@ -1,0 +1,52 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_REGION: "eu-north-1"
+    ECR_REPO: "sqs-consumer"
+    IMAGE_TAG: "latest"
+    # OPTIONAL ECS deploy vars:
+    # ECS_CLUSTER: "cdc-cluster"
+    # ECS_SERVICE: "sqs-consumer-svc"
+    # TD_FAMILY: "sqs-consumer"
+
+phases:
+  pre_build:
+    commands:
+      - echo "==> Resolve account & ECR URI"
+      - ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+      - ECR_URI=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}
+      - echo "==> Ensure ECR repo exists"
+      - aws ecr describe-repositories --repository-names ${ECR_REPO} --region ${AWS_REGION} >/dev/null 2>&1 || aws ecr create-repository --repository-name ${ECR_REPO} --region ${AWS_REGION} >/dev/null
+      - echo "==> Login to ECR"
+      - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+  build:
+    commands:
+      - echo "==> Build image"
+      - docker build -t ${ECR_REPO}:${IMAGE_TAG} .
+      - echo "==> Tag image"
+      - docker tag ${ECR_REPO}:${IMAGE_TAG} ${ECR_URI}:${IMAGE_TAG}
+      - echo "==> Push image"
+      - docker push ${ECR_URI}:${IMAGE_TAG}
+  post_build:
+    commands:
+      - echo "Build complete. Image: ${ECR_URI}:${IMAGE_TAG}"
+      # ===== OPTIONAL auto-deploy to ECS (uncomment to enable) =====
+      # - echo "==> Fetch current task definition"
+      # - aws ecs describe-task-definition --task-definition ${TD_FAMILY} --region ${AWS_REGION} --query 'taskDefinition' > td.json
+      # - echo "==> Create new task def JSON with updated image"
+      # - |
+      #   python - <<'PY'
+      #   import json, os
+      #   td=json.load(open('td.json'))
+      #   for k in ('taskDefinitionArn','revision','status','requiresAttributes','registeredBy','registeredAt','compatibilities'):
+      #       td.pop(k, None)
+      #   td['containerDefinitions'][0]['image'] = os.environ['ECR_URI']+':'+os.environ['IMAGE_TAG']
+      #   open('td-new.json','w').write(json.dumps(td))
+      #   PY
+      # - echo "==> Register new task definition"
+      # - NEW_TD_ARN=$(aws ecs register-task-definition --cli-input-json file://td-new.json --query 'taskDefinition.taskDefinitionArn' --output text --region ${AWS_REGION})
+      # - echo "==> Update ECS service"
+      # - aws ecs update-service --cluster ${ECS_CLUSTER} --service ${ECS_SERVICE} --task-definition ${NEW_TD_ARN} --region ${AWS_REGION}
+artifacts:
+  files: []
