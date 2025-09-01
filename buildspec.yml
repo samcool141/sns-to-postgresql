@@ -26,25 +26,5 @@ phases:
       - docker build -t ${ECR_URI}:${IMAGE_TAG} .
       - echo "Push"
       - docker push ${ECR_URI}:${IMAGE_TAG}
-  post_build:
-    commands:
-      - echo "Build complete. Image: ${ECR_URI}:${IMAGE_TAG}"
-      # ===== OPTIONAL auto-deploy to ECS (uncomment to enable) =====
-      # - echo "==> Fetch current task definition"
-      # - aws ecs describe-task-definition --task-definition ${TD_FAMILY} --region ${AWS_REGION} --query 'taskDefinition' > td.json
-      # - echo "==> Create new task def JSON with updated image"
-      # - |
-      #   python - <<'PY'
-      #   import json, os
-      #   td=json.load(open('td.json'))
-      #   for k in ('taskDefinitionArn','revision','status','requiresAttributes','registeredBy','registeredAt','compatibilities'):
-      #       td.pop(k, None)
-      #   td['containerDefinitions'][0]['image'] = os.environ['ECR_URI']+':'+os.environ['IMAGE_TAG']
-      #   open('td-new.json','w').write(json.dumps(td))
-      #   PY
-      # - echo "==> Register new task definition"
-      # - NEW_TD_ARN=$(aws ecs register-task-definition --cli-input-json file://td-new.json --query 'taskDefinition.taskDefinitionArn' --output text --region ${AWS_REGION})
-      # - echo "==> Update ECS service"
-      # - aws ecs update-service --cluster ${ECS_CLUSTER} --service ${ECS_SERVICE} --task-definition ${NEW_TD_ARN} --region ${AWS_REGION}
 artifacts:
   files: []
