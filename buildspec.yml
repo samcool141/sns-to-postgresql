@@ -22,11 +22,9 @@ phases:
       - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
   build:
     commands:
-      - echo "==> Build image"
-      - docker build -t ${ECR_REPO}:${IMAGE_TAG} .
-      - echo "==> Tag image"
-      - docker tag ${ECR_REPO}:${IMAGE_TAG} ${ECR_URI}:${IMAGE_TAG}
-      - echo "==> Push image"
+      - echo "Build image directly with final tag (no 'docker tag' step)"
+      - docker build -t ${ECR_URI}:${IMAGE_TAG} .
+      - echo "Push"
       - docker push ${ECR_URI}:${IMAGE_TAG}
   post_build:
     commands:
