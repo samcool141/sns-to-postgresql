@@ -124,6 +124,35 @@ def is_row_change(body: Dict[str, Any]) -> bool:
     ch = body.get("change") or []
     return len(ch) > 0
 
+# ---- NEW: generic column extraction (row_seq, row_ts, etc.) ----
+def extract_col_v2(obj: Dict[str, Any], name: str) -> Optional[Any]:
+    act = obj.get("action")
+    if act in ("I", "U", "D"):
+        v = _kvlist_get(obj.get("columns") or [], name)
+        if v is not None:
+            return v
+        v = _kvlist_get(obj.get("pk") or [], name)
+        if v is not None:
+            return v
+    return None
+
+def extract_col_v1(obj: Dict[str, Any], name: str) -> Optional[Any]:
+    for ch in obj.get("change") or []:
+        v = _names_vals_get(ch.get("columnnames") or [], ch.get("columnvalues") or [], name)
+        if v is not None:
+            return v
+        ok = ch.get("oldkeys") or {}
+        v = _names_vals_get(ok.get("keynames") or [], ok.get("keyvalues") or [], name)
+        if v is not None:
+            return v
+    return None
+
+def extract_col(obj: Dict[str, Any], name: str) -> Optional[Any]:
+    v = extract_col_v2(obj, name)
+    if v is not None:
+        return v
+    return extract_col_v1(obj, name)
+
 def unwrap_message(m: Dict[str, Any]) -> Tuple[Optional[int], Dict[str, Any]]:
     """
     Returns (sns_sequence, body_dict).
@@ -185,15 +214,25 @@ def parse_messages(messages: List[dict]) -> Tuple[List[Tuple], List[dict]]:
 
             commit_ts = parse_commit_ts(body)
             lsn = body.get("lsn") or ""  # optional
+
+            # NEW: extract row_seq if present (int), else None
+            row_seq_val = extract_col(body, "row_seq")
+            try:
+                row_seq = int(row_seq_val) if row_seq_val is not None and str(row_seq_val).strip() != "" else None
+            except Exception:
+                # If value is unexpectedly non-numeric, store NULL; payload remains intact
+                row_seq = None
+
             payload_json = json.dumps(body, separators=(",", ":"))
 
             rows.append((
                 str(customer_id),
-                sns_seq if sns_seq is not None else 0,  # keep schema unchanged
+                sns_seq if sns_seq is not None else 0,
                 str(lsn),
                 commit_ts,
                 table_name,
                 op,
+                row_seq,          # NEW: persisted in a dedicated column
                 payload_json
             ))
             handles.append(m)
@@ -208,7 +247,7 @@ def parse_messages(messages: List[dict]) -> Tuple[List[Tuple], List[dict]]:
 # ----------------------------
 INSERT_SQL = """
 INSERT INTO target.cdc_events
-  (customer_id, sns_sequence, lsn, commit_ts, table_name, op, payload)
+  (customer_id, sns_sequence, lsn, commit_ts, table_name, op, row_seq, payload)
 VALUES %s
 """
 
