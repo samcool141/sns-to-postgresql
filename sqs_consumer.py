@@ -22,11 +22,14 @@ SQS_ADDR = os.environ["SQS_URL"]
 # Target Aurora DSN provided via ECS "secrets" (ValueFrom)
 DB_DSN = os.environ["DB_DSN"]
 
-# Tuning knobs (sensible defaults)
-MAX_SQS_BATCH = int(os.getenv("MAX_SQS_BATCH", "10"))           # SQS receive max per call (<=10)
-WAIT_TIME_SEC = int(os.getenv("WAIT_TIME_SEC", "20"))           # SQS long poll
-VISIBILITY_TIMEOUT = int(os.getenv("VISIBILITY_TIMEOUT", "60")) # keep > DB insert time
-DB_BATCH_MAX = int(os.getenv("DB_BATCH_MAX", "500"))            # how many rows per execute_values commit
+# Tuning knobs
+MAX_SQS_BATCH      = int(os.getenv("MAX_SQS_BATCH", "10"))     # SQS receive max per call (<=10)
+WAIT_TIME_SEC      = int(os.getenv("WAIT_TIME_SEC", "20"))     # long poll when idle
+VISIBILITY_TIMEOUT = int(os.getenv("VISIBILITY_TIMEOUT", "120"))
+DB_BATCH_MAX       = int(os.getenv("DB_BATCH_MAX", "5000"))    # rows per DB commit
+DB_LINGER_MS       = int(os.getenv("DB_LINGER_MS", "50"))      # flush window
+RECEIVE_TRIPS_MAX  = int(os.getenv("RECEIVE_TRIPS_MAX", "50")) # max 0-wait receives before flush
+SYNC_OFF           = os.getenv("SYNC_OFF", "0") == "1"         # SET LOCAL synchronous_commit=off
 
 # CloudWatch-friendly logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -50,7 +53,6 @@ def to_queue_url(addr: str) -> str:
     return f"https://sqs.{region}.amazonaws.com/{acct}/{name}"
 
 # ---- wal2json helpers (v2 action frames + v1 change arrays) ----
-
 def _kvlist_get(items: List[Dict[str, Any]], key: str) -> Optional[Any]:
     for it in items or []:
         if it.get("name") == key:
@@ -60,14 +62,12 @@ def _kvlist_get(items: List[Dict[str, Any]], key: str) -> Optional[Any]:
 def _names_vals_get(names: List[str], vals: List[Any], key: str) -> Optional[Any]:
     if names and vals and key in names:
         try:
-            i = names.index(key)
-            return vals[i]
+            return vals[names.index(key)]
         except Exception:
             return None
     return None
 
 def extract_customer_id_v2(obj: Dict[str, Any]) -> Optional[str]:
-    """wal2json v2 'action' frames (I/U/D) with columns[] / pk[]."""
     act = obj.get("action")
     if act not in ("I", "U", "D"):
         return None
@@ -80,7 +80,6 @@ def extract_customer_id_v2(obj: Dict[str, Any]) -> Optional[str]:
     return None
 
 def extract_customer_id_v1(obj: Dict[str, Any]) -> Optional[str]:
-    """wal2json v1 'change' array with columnnames/columnvalues or oldkeys."""
     for ch in obj.get("change") or []:
         v = _names_vals_get(ch.get("columnnames") or [], ch.get("columnvalues") or [], "customer_id")
         if v is not None:
@@ -106,25 +105,22 @@ def parse_table_name(body: Dict[str, Any]) -> str:
     return f"{schema}.{table}" if schema and table else (schema or table or "unknown")
 
 def parse_op(body: Dict[str, Any]) -> str:
-    # Normalize operation for storage
     act = body.get("action")  # v2
     if act in ("I", "U", "D"):
         return {"I": "insert", "U": "update", "D": "delete"}[act]
-    # fallback to v1-ish hints
     return body.get("kind") or body.get("op") or body.get("operation") or "unknown"
 
 def parse_commit_ts(body: Dict[str, Any]) -> Optional[str]:
     return body.get("timestamp") or body.get("commit_ts") or body.get("created_at")
 
 def is_row_change(body: Dict[str, Any]) -> bool:
-    """True only for I/U/D (v2) or when v1 change[] exists and non-empty."""
     act = body.get("action")
     if act is not None:
         return act in ("I", "U", "D")
     ch = body.get("change") or []
     return len(ch) > 0
 
-# ---- NEW: generic column extraction (row_seq, row_ts, etc.) ----
+# Generic column extraction (for row_seq, etc.)
 def extract_col_v2(obj: Dict[str, Any], name: str) -> Optional[Any]:
     act = obj.get("action")
     if act in ("I", "U", "D"):
@@ -164,13 +160,10 @@ def unwrap_message(m: Dict[str, Any]) -> Tuple[Optional[int], Dict[str, Any]]:
     try:
         maybe_env = json.loads(body_text)
     except Exception:
-        # Not JSON? Treat as empty
         return None, {}
 
-    # Standard SNS envelope?
     if isinstance(maybe_env, dict) and maybe_env.get("Type") == "Notification" and "Message" in maybe_env:
         sns_seq = None
-        # FIFO SNS adds SequenceNumber
         try:
             sns_seq = int(maybe_env.get("SequenceNumber")) if "SequenceNumber" in maybe_env else None
         except Exception:
@@ -181,7 +174,6 @@ def unwrap_message(m: Dict[str, Any]) -> Tuple[Optional[int], Dict[str, Any]]:
             body = {"raw": maybe_env.get("Message")}
         return sns_seq, body
 
-    # Raw delivery case: Body is the actual message
     return None, maybe_env if isinstance(maybe_env, dict) else {}
 
 def parse_messages(messages: List[dict]) -> Tuple[List[Tuple], List[dict]]:
@@ -200,10 +192,8 @@ def parse_messages(messages: List[dict]) -> Tuple[List[Tuple], List[dict]]:
 
             # Only process row-change frames (I/U/D for v2; non-empty change[] for v1)
             if not is_row_change(body):
-                # Skip quietly but keep slot/queue flowing
                 continue
 
-            # Extract essentials
             table_name = parse_table_name(body)
             op = parse_op(body)
             customer_id = extract_customer_id(body)
@@ -215,13 +205,19 @@ def parse_messages(messages: List[dict]) -> Tuple[List[Tuple], List[dict]]:
             commit_ts = parse_commit_ts(body)
             lsn = body.get("lsn") or ""  # optional
 
-            # NEW: extract row_seq if present (int), else None
+            # row_seq (int) if present
             row_seq_val = extract_col(body, "row_seq")
             try:
                 row_seq = int(row_seq_val) if row_seq_val is not None and str(row_seq_val).strip() != "" else None
             except Exception:
-                # If value is unexpectedly non-numeric, store NULL; payload remains intact
                 row_seq = None
+
+            # Capture the actual SQS MessageGroupId that delivered this message
+            msg_group_id = None
+            try:
+                msg_group_id = m.get("Attributes", {}).get("MessageGroupId")
+            except Exception:
+                msg_group_id = None
 
             payload_json = json.dumps(body, separators=(",", ":"))
 
@@ -232,7 +228,8 @@ def parse_messages(messages: List[dict]) -> Tuple[List[Tuple], List[dict]]:
                 commit_ts,
                 table_name,
                 op,
-                row_seq,          # NEW: persisted in a dedicated column
+                row_seq,
+                msg_group_id,
                 payload_json
             ))
             handles.append(m)
@@ -247,7 +244,7 @@ def parse_messages(messages: List[dict]) -> Tuple[List[Tuple], List[dict]]:
 # ----------------------------
 INSERT_SQL = """
 INSERT INTO target.cdc_events
-  (customer_id, sns_sequence, lsn, commit_ts, table_name, op, row_seq, payload)
+  (customer_id, sns_sequence, lsn, commit_ts, table_name, op, row_seq, msg_group_id, payload)
 VALUES %s
 """
 
@@ -256,65 +253,98 @@ def db_insert(conn, rows: List[Tuple]):
     if not rows:
         return
     with conn.cursor() as cur:
+        if SYNC_OFF:
+            cur.execute("SET LOCAL synchronous_commit = off")
         execute_values(cur, INSERT_SQL, rows, page_size=min(DB_BATCH_MAX, len(rows)))
     conn.commit()
 
 # ----------------------------
-# Main loop
+# Main loop (batch + short linger, no reordering)
 # ----------------------------
 def main():
     log.info("sqs-consumer starting (region=%s)", AWS_REGION)
 
-    # Resolve queue URL (handles ARN or URL)
     queue_url = to_queue_url(SQS_ADDR)
     log.info("Using queue URL: %s", queue_url)
 
-    # boto3 clients
     sqs = boto3.client("sqs", region_name=AWS_REGION)
 
-    # DB connection (persistent)
     conn = psycopg2.connect(DB_DSN)
     conn.autocommit = False
 
+    rows: List[Tuple] = []
+    handles: List[dict] = []
+
+    def flush():
+        if not rows:
+            return
+        n = len(rows)
+        t0 = time.monotonic()
+        db_insert(conn, rows)
+        # delete SQS in chunks of 10
+        entries = [{"Id": str(i), "ReceiptHandle": m["ReceiptHandle"]} for i, m in enumerate(handles)]
+        for i in range(0, len(entries), 10):
+            try:
+                sqs.delete_message_batch(QueueUrl=queue_url, Entries=entries[i:i+10])
+            except Exception as e:
+                log.exception("delete_message_batch failed; will retry on redelivery. Err: %s", e)
+        rows.clear()
+        handles.clear()
+        dt = (time.monotonic() - t0) * 1000.0
+        log.info("flushed %d rows in %.1f ms (DB_BATCH_MAX=%d, LINGER=%d ms)", n, dt, DB_BATCH_MAX, DB_LINGER_MS)
+
     try:
         while True:
-            resp = sqs.receive_message(
-                QueueUrl=queue_url,
-                MaxNumberOfMessages=MAX_SQS_BATCH,
-                WaitTimeSeconds=WAIT_TIME_SEC,
-                VisibilityTimeout=VISIBILITY_TIMEOUT,
-                MessageAttributeNames=["All"],
-                AttributeNames=["All"],
-            )
+            start = time.monotonic()
+            trips = 0
 
-            messages = resp.get("Messages", [])
-            if not messages:
-                continue
+            # Fast-drain loop: build a big batch quickly (no wait)
+            while True:
+                resp = sqs.receive_message(
+                    QueueUrl=queue_url,
+                    MaxNumberOfMessages=MAX_SQS_BATCH,
+                    WaitTimeSeconds=0,  # no wait while draining
+                    VisibilityTimeout=VISIBILITY_TIMEOUT,
+                    MessageAttributeNames=["All"],
+                    AttributeNames=["All"],
+                )
+                msgs = resp.get("Messages", [])
+                trips += 1
 
-            rows, handles = parse_messages(messages)
-            if not rows:
-                # nothing we could parse/use; don't delete
-                log.debug("Polled %d messages, 0 usable row-change frames", len(messages))
-                continue
+                if msgs:
+                    new_rows, new_handles = parse_messages(msgs)
+                    rows.extend(new_rows)      # keep delivery order (per-group FIFO)
+                    handles.extend(new_handles)
 
-            # Insert into target; only delete SQS if commit succeeds
-            try:
-                db_insert(conn, rows)
-            except Exception as e:
-                log.exception("DB insert failed; NOT deleting SQS messages. Error: %s", e)
-                # Let visibility timeout expire → messages will be retried / land in DLQ
-                conn.rollback()
-                time.sleep(1)
-                continue
+                # Flush conditions: size, linger, or too many receive trips
+                if len(rows) >= DB_BATCH_MAX:
+                    flush()
+                    break
+                if (time.monotonic() - start) * 1000 >= DB_LINGER_MS:
+                    if rows:
+                        flush()
+                    break
+                if trips >= RECEIVE_TRIPS_MAX:
+                    if rows:
+                        flush()
+                    break
 
-            # Delete successfully processed messages (in chunks of 10)
-            entries = [{"Id": str(i), "ReceiptHandle": m["ReceiptHandle"]} for i, m in enumerate(handles)]
-            for i in range(0, len(entries), 10):
-                chunk = entries[i:i+10]
-                try:
-                    sqs.delete_message_batch(QueueUrl=queue_url, Entries=chunk)
-                except Exception as e:
-                    log.exception("delete_message_batch failed (will retry on next delivery). Error: %s", e)
+            # If nothing drained, fall back to long poll when idle
+            if not rows and not handles:
+                resp = sqs.receive_message(
+                    QueueUrl=queue_url,
+                    MaxNumberOfMessages=MAX_SQS_BATCH,
+                    WaitTimeSeconds=WAIT_TIME_SEC,  # long poll only when idle
+                    VisibilityTimeout=VISIBILITY_TIMEOUT,
+                    MessageAttributeNames=["All"],
+                    AttributeNames=["All"],
+                )
+                msgs = resp.get("Messages", [])
+                if msgs:
+                    new_rows, new_handles = parse_messages(msgs)
+                    rows.extend(new_rows)
+                    handles.extend(new_handles)
+                    flush()
 
     finally:
         try:
