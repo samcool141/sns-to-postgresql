@@ -47,7 +47,7 @@ INSERT INTO target.cdc_events
 VALUES %s
 """
 
-def db_insert(conn, rows: List[Tuple]]):
+def db_insert(conn, rows: List[Tuple]):
     """Batch insert rows into target.cdc_events using execute_values."""
     if not rows:
         return
